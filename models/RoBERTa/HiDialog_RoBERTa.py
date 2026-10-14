@@ -39,6 +39,7 @@ class RobertaEmbeddings(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
         self.padding_idx = config.pad_token_id
+        self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
         self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
 
     def forward(self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None, speaker_ids=None):
@@ -544,8 +545,19 @@ class HiDialog_RoBERTa(RobertaPreTrainedModel):
             mask = cls_indices[batch_idx].unsqueeze(-1).expand(-1, sequence_output.shape[-1])
             features_graph = torch.masked_select(sequence_output, mask).view(-1, sequence_output.shape[-1])
 
+            num_graph_nodes = graph.number_of_nodes('node')
+            if features_graph.shape[0] > num_graph_nodes:
+                features_graph = features_graph[:num_graph_nodes, :]
+            elif features_graph.shape[0] < num_graph_nodes:
+                pad_tensor = torch.zeros(num_graph_nodes - features_graph.shape[0],
+                                         features_graph.shape[1]).to(features_graph.device)
+                features_graph = torch.cat([features_graph, pad_tensor], dim=0)
+
             graph_features, _, _ = self.gtn(graph, features_graph, output_gtn_adjacency=output_attentions)
-            graph_outputs.append(graph_features)
+            dialog_node = graph_features[0]
+            obj_node = graph_features[-2]
+            subj_node = graph_features[-1]
+            graph_outputs.append(torch.cat([dialog_node, obj_node, subj_node], dim=-1))
 
         pooled_output = self.dropout(torch.stack(graph_outputs))
         logits = self.classifier(pooled_output).view(-1, self.num_labels)

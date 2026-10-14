@@ -4,6 +4,7 @@ import logging
 import os
 import pickle
 import random
+import re
 from collections import defaultdict
 from itertools import permutations
 
@@ -238,24 +239,20 @@ def convert_examples_to_features(examples, max_seq_length, tokenizer, dataset="D
 
 def convert_examples_to_features_roberta(examples, max_seq_length, tokenizer, dataset="DialogRE"):
     features = []
+    cls_token_id = getattr(tokenizer, "cls_token_id", 0)
+    eos_token_id = getattr(tokenizer, "eos_token_id", 2)
+    pad_token_id = getattr(tokenizer, "pad_token_id", 1)
 
     for example in examples:
         dialogue = example.text_a
         entity1 = example.text_b
         entity2 = example.text_c
 
-        turns = dialogue.split("[TURNEND]")
-        speaker_ids = []
-        mention_ids = []
-        all_tokens = []
-        turn_boundaries = []
+        turns = [t.strip() for t in re.split(r"\[TURNEND\]", dialogue, flags=re.IGNORECASE) if t.strip()]
+        speaker_id_map = {}
+        turn_segments = []
 
-        current_turn = 0
-        for turn_idx, turn in enumerate(turns):
-            turn = turn.strip()
-            if not turn:
-                continue
-
+        for turn in turns:
             if ":" in turn:
                 speaker, content = turn.split(":", 1)
                 speaker = speaker.strip()
@@ -264,90 +261,87 @@ def convert_examples_to_features_roberta(examples, max_seq_length, tokenizer, da
                 speaker = "speaker 0"
                 content = turn
 
+            speaker_num = int(speaker.split()[-1]) if speaker.split()[-1].isdigit() else 0
+            if speaker_num not in speaker_id_map:
+                speaker_id_map[speaker_num] = len(speaker_id_map) + 1
+            sid = speaker_id_map[speaker_num]
+
             speaker_tokens_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(speaker + " "))
             content_tokens_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(content))
-
-            speaker_id = 0
-            for i in range(len(speaker.split())):
-                speaker_ids.append(speaker_id + i + 1)
-            mention_ids.append(len(all_tokens))
-            all_tokens.extend(speaker_tokens_ids)
-            while len(speaker_ids) < len(mention_ids):
-                speaker_ids.append(speaker_ids[-1] if speaker_ids else 0)
-
-            content_start = len(all_tokens)
-            for _ in content_tokens_ids:
-                mention_ids.append(mention_ids[-1])
-            all_tokens.extend(content_tokens_ids)
-
-            speaker_id = int(speaker.split()[-1]) if speaker.split()[-1].isdigit() else 0
-
-            turn_boundaries.append((content_start, len(all_tokens)))
-
-            if turn_idx < len(turns) - 1:
-                turnend_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("[TURNEND]"))
-                all_tokens.extend(turnend_ids)
-                for _ in range(len(turnend_ids)):
-                    mention_ids.append(mention_ids[-1] if mention_ids else 0)
-                    speaker_ids.append(speaker_id)
+            turn_segments.append((speaker_tokens_ids, content_tokens_ids, sid))
 
         entity1_tokens_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(" " + entity1))
         entity2_tokens_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(" " + entity2))
 
-        turn_end_id = tokenizer.convert_tokens_to_ids(["[TURNEND]"])[0] if "[TURNEND]" in tokenizer.get_vocab() else 0
-        all_tokens.append(turn_end_id if turn_end_id else 0)
-        mention_ids.append(mention_ids[-1] if mention_ids else 0)
-        speaker_ids.append(0)
+        budget = max_seq_length - 1 - len(entity1_tokens_ids) - len(entity2_tokens_ids) - 1
+        kept_segments = []
+        used = 0
+        for seg in turn_segments:
+            if used + len(seg[0]) + len(seg[1]) > budget:
+                break
+            kept_segments.append(seg)
+            used += len(seg[0]) + len(seg[1])
 
-        mention_ids.append(len(all_tokens))
-        speaker_ids.append(0)
+        all_tokens = [cls_token_id]
+        mention_ids = [0]
+        speaker_ids = [0]
+        cls_positions = [0]
+
+        mention_counter = 1
+        for speaker_tokens_ids, content_tokens_ids, sid in kept_segments:
+            cls_positions.append(len(all_tokens))
+            all_tokens.extend(speaker_tokens_ids)
+            mention_ids.extend([mention_counter] * len(speaker_tokens_ids))
+            speaker_ids.extend([sid] * len(speaker_tokens_ids))
+            all_tokens.extend(content_tokens_ids)
+            mention_ids.extend([mention_counter] * len(content_tokens_ids))
+            speaker_ids.extend([sid] * len(content_tokens_ids))
+            mention_counter += 1
+
+        cls_positions.append(len(all_tokens))
         all_tokens.extend(entity1_tokens_ids)
+        mention_ids.extend([mention_counter] * len(entity1_tokens_ids))
+        speaker_ids.extend([0] * len(entity1_tokens_ids))
+        mention_counter += 1
 
-        all_tokens.append(turn_end_id if turn_end_id else 0)
-        mention_ids.append(mention_ids[-1])
-        speaker_ids.append(0)
-
-        mention_ids.append(len(all_tokens))
-        speaker_ids.append(0)
+        cls_positions.append(len(all_tokens))
         all_tokens.extend(entity2_tokens_ids)
+        mention_ids.extend([mention_counter] * len(entity2_tokens_ids))
+        speaker_ids.extend([0] * len(entity2_tokens_ids))
 
-        all_tokens.append(tokenizer.eos_token_id if hasattr(tokenizer, 'eos_token_id') else 0)
-        mention_ids.append(mention_ids[-1])
+        all_tokens.append(eos_token_id)
+        mention_ids.append(mention_ids[-1] if mention_ids else 0)
         speaker_ids.append(0)
 
         if len(all_tokens) > max_seq_length:
             all_tokens = all_tokens[:max_seq_length]
             mention_ids = mention_ids[:max_seq_length]
             speaker_ids = speaker_ids[:max_seq_length]
-
-        while len(mention_ids) < len(all_tokens):
-            mention_ids.append(mention_ids[-1] if mention_ids else 0)
-        while len(speaker_ids) < len(all_tokens):
-            speaker_ids.append(speaker_ids[-1] if speaker_ids else 0)
+            cls_positions = [p for p in cls_positions if p < max_seq_length]
 
         padding_length = max_seq_length - len(all_tokens)
-        all_tokens += [tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else 0] * padding_length
+        all_tokens += [pad_token_id] * padding_length
         mention_ids += [0] * padding_length
         speaker_ids += [0] * padding_length
 
         CLS_indices = [False] * max_seq_length
-        for start, end in turn_boundaries:
-            if start < max_seq_length:
-                CLS_indices[start] = True
+        for pos in cls_positions:
+            CLS_indices[pos] = True
 
-        unique_mids = sorted(set(mention_ids))
+        unique_mids = sorted(set(m for m in mention_ids if m > 0))
         if len(unique_mids) >= 3:
             head_mid = unique_mids[-2]
             tail_mid = unique_mids[-1]
         else:
-            head_mid = 0
+            head_mid = unique_mids[-1] if unique_mids else 0
             tail_mid = 0
         mentioned_h = [head_mid]
         mentioned_t = [tail_mid]
 
         hidialog_mask = np.zeros((max_seq_length, max_seq_length), dtype=np.float32)
-        for i in range(min(len(all_tokens), max_seq_length)):
-            for j in range(i + 1, min(len(all_tokens), max_seq_length)):
+        seq_len = max_seq_length - padding_length
+        for i in range(seq_len):
+            for j in range(i + 1, seq_len):
                 if mention_ids[i] == mention_ids[j] or speaker_ids[i] == speaker_ids[j]:
                     hidialog_mask[i, j] = 1.0
                     hidialog_mask[j, i] = 1.0
@@ -355,7 +349,7 @@ def convert_examples_to_features_roberta(examples, max_seq_length, tokenizer, da
         features.append([Feature(
             input_ids=all_tokens,
             segment_ids=[0] * max_seq_length,
-            input_mask=[1 if t != (tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else 0) else 0 for t in all_tokens],
+            input_mask=[1 if t != pad_token_id else 0 for t in all_tokens],
             speaker_ids=speaker_ids,
             label_id=example.label,
             mention_ids=mention_ids,
